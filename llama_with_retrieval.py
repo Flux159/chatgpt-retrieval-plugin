@@ -1,13 +1,11 @@
 from typing import List
 import requests
-import openai
 import subprocess
 import os
 import tempfile
 import sys
 
 from tenacity import retry, wait_random_exponential, stop_after_attempt
-
 
 @retry(wait=wait_random_exponential(min=1, max=20), stop=stop_after_attempt(3))
 def get_context(prompt: str) -> List[str]:
@@ -21,26 +19,8 @@ def get_context(prompt: str) -> List[str]:
         A list of document chunks from the data store, sorted by proximity of vector similarity.
     """
 
-    retrieval_endpoint = os.environ.get("DATASTORE_QUERY_URL")
+    retrieval_endpoint = os.environ.get("DATASTORE_QUERY_URL", "http://0.0.0.0:8000/query")
     bearer_token = os.environ.get("BEARER_TOKEN")
-
-    # curl -X 'POST' \
-    #   'http://0.0.0.0:8000/query' \
-    #   -H 'accept: application/json' \
-    #   -H 'Authorization: Bearer test1234' \
-    #   -H 'Content-Type: application/json' \
-    #   -d '{
-    #   "queries": [
-    #     {
-    #       "query": "How do I activate Conda?",
-    #       "filter": {
-    #         "document_id": "4827d5ac-2875-40ac-9279-dab0964cbf5a"
-    #       },
-    #       "top_k": 3
-    #     }
-    #   ]
-    # }'
-
 
     headers = {
         "Content-Type": "application/json", 
@@ -92,47 +72,45 @@ Answer:
     return full_prompt
 
 
-
 @retry(wait=wait_random_exponential(min=1, max=20), stop=stop_after_attempt(3))
 def invoke_llama_with_context(prompt: str, token_limit: int) -> None:
     context_array = get_context(prompt)
     full_prompt = generate_retrieval_prompt(prompt, context_array, token_limit)
 
+    prompt_file_path = ""
+
     with tempfile.NamedTemporaryFile(mode='w', delete=False) as prompt_file:
         # Write the prompt to the file
         prompt_file.write(full_prompt)
+        prompt_file_path = prompt_file.name
+        
+    llama_cwd = os.environ.get("LLAMA_WORKING_DIRECTORY")
 
-        llama_cwd = os.environ.get("LLAMA_WORKING_DIRECTORY")
+    llama_cmd = os.environ.get("LLAMA_CMD", f"./main -m ./models/7B/ggml-model-q4_0.bin")
 
-        print(llama_cwd)
+    # Call LLaMa with streaming responses
+    process = subprocess.Popen(f"{llama_cmd} -f {prompt_file_path}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=llama_cwd)
 
-        llama_cmd = os.environ.get("LLAMA_CMD", "./main -m ./models/7B/ggml-model-q4_0.bin")
+    while True:
+        # Read data from stdout and stderr streams
+        stdout_data = process.stdout.readline()
+        stderr_data = process.stderr.readline()
 
-        # Call LLaMa with streaming responses
-        process = subprocess.Popen([f"{llama_cmd} -f {prompt_file.name}"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=llama_cwd)
+        # Check for end of stream
+        if (not stdout_data) and (not stderr_data):
+            break
 
-        while True:
-            # Read data from stdout and stderr streams
-            stdout_data = process.stdout.readline()
-            stderr_data = process.stderr.readline()
+        # Display the output
+        if stdout_data:
+            print(stdout_data.decode().strip())
+        #if stderr_data:
+            #print("STDERR: " + stderr_data.decode().strip())
 
-            # Check for end of stream
-            if (not stdout_data) and (not stderr_data):
-                break
-
-            # Display the output
-            if stdout_data:
-                print("STDOUT: " + stdout_data.decode().strip())
-            if stderr_data:
-                print("STDERR: " + stderr_data.decode().strip())
-
-        # Wait for the process to exit
-        process.wait()
+    # Wait for the process to exit
+    process.wait()
 
 
 #prompt = "How do I activate Conda for my project?"
-#context_arr = get_context(prompt)
-#generate_retrieval_prompt(prompt, context_array=context_arr, token_limit=1600)
 prompt = sys.argv[1]
 
 # Note: token_limit is set to 1600 to leave room for the response from LLaMa (7B model maxes out at 2048 tokens)
