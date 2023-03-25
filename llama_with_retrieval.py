@@ -1,10 +1,11 @@
 from typing import List
 import requests
-import openai
+import subprocess
 import os
+import tempfile
+import sys
 
 from tenacity import retry, wait_random_exponential, stop_after_attempt
-
 
 @retry(wait=wait_random_exponential(min=1, max=20), stop=stop_after_attempt(3))
 def get_context(prompt: str) -> List[str]:
@@ -18,26 +19,8 @@ def get_context(prompt: str) -> List[str]:
         A list of document chunks from the data store, sorted by proximity of vector similarity.
     """
 
-    retrieval_endpoint = os.environ.get("DATASTORE_QUERY_URL")
+    retrieval_endpoint = os.environ.get("DATASTORE_QUERY_URL", "http://0.0.0.0:8000/query")
     bearer_token = os.environ.get("BEARER_TOKEN")
-
-    # curl -X 'POST' \
-    #   'http://0.0.0.0:8000/query' \
-    #   -H 'accept: application/json' \
-    #   -H 'Authorization: Bearer test1234' \
-    #   -H 'Content-Type: application/json' \
-    #   -d '{
-    #   "queries": [
-    #     {
-    #       "query": "How do I activate Conda?",
-    #       "filter": {
-    #         "document_id": "4827d5ac-2875-40ac-9279-dab0964cbf5a"
-    #       },
-    #       "top_k": 3
-    #     }
-    #   ]
-    # }'
-
 
     headers = {
         "Content-Type": "application/json", 
@@ -54,51 +37,82 @@ def get_context(prompt: str) -> List[str]:
         ]
     }
 
-    print(f"url={retrieval_endpoint}")
+    response = requests.post(url=retrieval_endpoint, json=data, headers=headers)
+    response_json = response.json()
 
-    response = requests.post(url=retrieval_endpoint, data=data, headers=headers)
+    results = response_json["results"][0]["results"]
 
-    print(response.text)
+    context = []
 
+    # Iterate over the array and extract the "text" values
+    for item in results:
+        context.append(item["text"])
 
-    # Call the OpenAI API to get the embeddings
-    # response = openai.Embedding.create(input=texts, model="text-embedding-ada-002")
+    return context
 
-    # # Extract the embedding data from the response
-    # data = response["data"]  # type: ignore
+def generate_retrieval_prompt(prompt: str, context_array: List[str], token_limit: int) -> str:
+    prompt_template=f"""Use the following context to answer the question below. You are not allowed to answer anything outside of the specified context.
 
-    # # Return the embeddings as a list of lists of floats
-    # return [result["embedding"] for result in data]
+Context:
+<context>
+
+Question:
+{prompt}
+
+Answer:
+
+"""
+
+    limit = token_limit - len(prompt_template)
+    context = "\n".join(context_array)
+    token_limited_context = context[:limit]
+
+    full_prompt = prompt_template.replace("<context>", token_limited_context)
+
+    return full_prompt
 
 
 @retry(wait=wait_random_exponential(min=1, max=20), stop=stop_after_attempt(3))
-def get_chat_completion(
-    messages,
-    model="gpt-3.5-turbo",  # use "gpt-4" for better results
-):
-    """
-    Generate a chat completion using OpenAI's chat completion API.
+def invoke_llama_with_context(prompt: str, token_limit: int) -> None:
+    context_array = get_context(prompt)
+    full_prompt = generate_retrieval_prompt(prompt, context_array, token_limit)
 
-    Args:
-        messages: The list of messages in the chat history.
-        model: The name of the model to use for the completion. Default is gpt-3.5-turbo, which is a fast, cheap and versatile model. Use gpt-4 for higher quality but slower results.
+    prompt_file_path = ""
 
-    Returns:
-        A string containing the chat completion.
+    with tempfile.NamedTemporaryFile(mode='w', delete=False) as prompt_file:
+        # Write the prompt to the file
+        prompt_file.write(full_prompt)
+        prompt_file_path = prompt_file.name
+        
+    llama_cwd = os.environ.get("LLAMA_WORKING_DIRECTORY")
 
-    Raises:
-        Exception: If the OpenAI API call fails.
-    """
-    # call the OpenAI chat completion API with the given messages
-    response = openai.ChatCompletion.create(
-        model=model,
-        messages=messages,
-    )
+    llama_cmd = os.environ.get("LLAMA_CMD", f"./main -m ./models/7B/ggml-model-q4_0.bin")
 
-    choices = response["choices"]  # type: ignore
-    completion = choices[0].message.content.strip()
-    print(f"Completion: {completion}")
-    return completion
+    # Call LLaMa with streaming responses
+    process = subprocess.Popen(f"{llama_cmd} -f {prompt_file_path}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=llama_cwd)
+
+    while True:
+        # Read data from stdout and stderr streams
+        stdout_data = process.stdout.readline()
+        stderr_data = process.stderr.readline()
+
+        # Check for end of stream
+        if (not stdout_data) and (not stderr_data):
+            break
+
+        # Display the output
+        if stdout_data:
+            print(stdout_data.decode().strip())
+        #if stderr_data:
+            #print("STDERR: " + stderr_data.decode().strip())
+
+    # Wait for the process to exit
+    process.wait()
 
 
-get_context("How do I activate Conda for my project?")
+#prompt = "How do I activate Conda for my project?"
+prompt = sys.argv[1]
+
+# Note: token_limit is set to 1600 to leave room for the response from LLaMa (7B model maxes out at 2048 tokens)
+# Consider specifying this as an argument to the script
+invoke_llama_with_context(prompt, token_limit=1600)
